@@ -1,8 +1,8 @@
-"""Preenche coluna 'resposta' do xlsx do CMS com tabela markdown de etapas.
+"""Preenche coluna 'Resposta' do xlsx de pendências do CMS com tabela markdown de etapas.
 
 Fluxo:
-1. Lê xlsx 7 colunas (tipo | id | órgão | ativo | título | status | resposta).
-2. Filtra tipo='serviço' AND ativo='sim' AND resposta contém 'sem etapa'.
+1. Lê xlsx 7 colunas (entidade | source_id | orgao | ativo | registro | motivos | Resposta).
+2. Filtra entidade='serviço' AND ativo='sim' AND motivos contém 'sem etapa'.
 3. Pra cada id, consulta banco PostgreSQL admin_prd (ou --inspect pra descobrir schema).
 4. Formata etapas como tabela markdown e grava na coluna resposta.
 5. Backup .bak antes de salvar.
@@ -31,7 +31,7 @@ from openpyxl import load_workbook
 # ---------- schema (ajustar após --inspect confirmar nome real) ----------
 # Hipótese H1: tabela dedicada. Trocar nomes conforme banco.
 QUERY_ETAPAS = """
-    SELECT ordem, titulo, canal, conteudo
+    SELECT ordem, titulo, canal_prestacao, conteudo
     FROM gerenciamento_jornada
     WHERE servico_id = %s
     ORDER BY ordem
@@ -129,7 +129,12 @@ def buscar_etapas(conn, servico_id: int) -> list[dict]:
         cur.execute(QUERY_ETAPAS, (servico_id,))
         rows = cur.fetchall()
     return [
-        {"ordem": r[0], "titulo": r[1], "canal": r[2] or CANAL_DEFAULT, "conteudo": to_text(r[3])}
+        {
+            "ordem": r[0],
+            "titulo": r[1],
+            "canal": " / ".join(r[2]) if r[2] else CANAL_DEFAULT,
+            "conteudo": to_text(r[3]),
+        }
         for r in rows
     ]
 
@@ -180,7 +185,7 @@ def main() -> int:
     ws = wb.active
     cols = mapear_colunas(ws)
 
-    obrigatorias = ("tipo", "id", "ativo", "resposta")
+    obrigatorias = ("entidade", "source_id", "ativo", "motivos", "resposta")
     faltam = [c for c in obrigatorias if c not in cols]
     if faltam:
         print(f"[erro] cabeçalhos faltando: {faltam}", file=sys.stderr)
@@ -189,19 +194,23 @@ def main() -> int:
 
     alvos = []
     for row_idx in range(2, ws.max_row + 1):
-        tipo = (ws.cell(row_idx, cols["tipo"]).value or "").strip().lower()
+        entidade = (ws.cell(row_idx, cols["entidade"]).value or "").strip().lower()
         ativo = (ws.cell(row_idx, cols["ativo"]).value or "").strip().lower()
-        resposta = str(ws.cell(row_idx, cols["resposta"]).value or "").lower()
-        if tipo == "serviço" and ativo == "sim" and FILTRO_RESPOSTA in resposta:
+        motivos = str(ws.cell(row_idx, cols["motivos"]).value or "").lower()
+        resposta = ws.cell(row_idx, cols["resposta"]).value
+        if entidade == "serviço" and ativo == "sim" and FILTRO_RESPOSTA in motivos and not resposta:
             alvos.append(row_idx)
 
     if args.limit:
         alvos = alvos[: args.limit]
 
     print(f"[alvos] {len(alvos)} linhas pra preencher")
+    def _sid(r: int) -> int:
+        return int(float(str(ws.cell(r, cols["source_id"]).value)))
+
     if args.dry_run:
         for r in alvos[:20]:
-            print(f"  linha {r} id={ws.cell(r, cols['id']).value}")
+            print(f"  linha {r} id={_sid(r)} orgao={ws.cell(r, cols.get('orgao', 0)).value}")
         if len(alvos) > 20:
             print(f"  ... (+{len(alvos)-20})")
         return 0
@@ -209,9 +218,9 @@ def main() -> int:
     ok = sem_etapas = erros = 0
     with conectar() as conn:
         for r in alvos:
-            sid = ws.cell(r, cols["id"]).value
+            sid = _sid(r)
             try:
-                etapas = buscar_etapas(conn, int(sid))
+                etapas = buscar_etapas(conn, sid)
             except Exception as e:
                 erros += 1
                 print(f"[erro] linha {r} id={sid}: {e}", file=sys.stderr)
@@ -222,6 +231,7 @@ def main() -> int:
                 continue
             ws.cell(r, cols["resposta"]).value = formatar_tabela(etapas)
             ok += 1
+        conn.rollback()  # read-only, descarta transação
 
     backup = xlsx.with_suffix(xlsx.suffix + ".bak")
     shutil.copy2(xlsx, backup)
